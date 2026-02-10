@@ -31,9 +31,6 @@ namespace MortarStrikes
         [JsonProperty("maxStrikesPerRaid")]
         public int MaxStrikesPerRaid { get; set; } = 3;
 
-        [JsonProperty("_comment_strike")]
-        public string _c10 { get; set; } = "=== STRIKE ===";
-
         [JsonProperty("barrageCount")]
         public int BarrageCount { get; set; } = 3;
 
