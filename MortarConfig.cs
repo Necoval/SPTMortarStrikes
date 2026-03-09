@@ -89,7 +89,19 @@ namespace MortarStrikes
         public float WarningDelaySeconds { get; set; } = 15f;
 
         [JsonProperty("_comment_warningDelay")]
-        public string _c20d { get; set; } = "Seconds to wait after smoke appears before the barrage starts";
+        public string _c20d { get; set; } = "Seconds after siren/smoke before barrage impacts. Barrage fires early so shells (fly ~30s) land near this time.";
+
+        [JsonProperty("artilleryFlyTimeSeconds")]
+        public float ArtilleryFlyTimeSeconds { get; set; } = 10f;
+
+        [JsonProperty("_comment_artilleryFlyTime")]
+        public string _c20e2 { get; set; } = "The time it takes for the bombs to drop.";
+
+        [JsonProperty("artilleryFlyTimeRandom")]
+        public float ArtilleryFlyTimeRandom { get; set; } = 0f;
+
+        [JsonProperty("_comment_artilleryFlyTimeRandom")]
+        public string _c20e3 { get; set; } = "Random 0-N seconds added to fly time. E.g. 6 gives 0-6s variance.";
 
         [JsonProperty("sirenEnabled")]
         public bool SirenEnabled { get; set; } = true;
