@@ -18,6 +18,7 @@ namespace MortarStrikes
         public static ConfigEntry<KeyboardShortcut> DebugTriggerKey;
 
         private MortarStrikeManager _strikeManager;
+        private bool _fikaRaidStartedSubscribed;
 
         private void Awake()
         {
@@ -29,14 +30,19 @@ namespace MortarStrikes
             Log.LogInfo("Mortar Strikes v1.0.0 loaded. Config: BepInEx/plugins/MortarStrikes/config.json");
 
             FikaSync.Init();
+            _fikaRaidStartedSubscribed = FikaSync.TrySubscribeRaidStarted(OnFikaRaidStarted);
+        }
+
+        private void OnFikaRaidStarted()
+        {
+            CreateStrikeManager(raidAlreadyStarted: true);
         }
 
         private void Update()
         {
-            if (_strikeManager == null && IsInRaid())
+            if (_strikeManager == null && !_fikaRaidStartedSubscribed && IsInRaid())
             {
-                var go = new GameObject("MortarStrikeManager");
-                _strikeManager = go.AddComponent<MortarStrikeManager>();
+                CreateStrikeManager(raidAlreadyStarted: false);
             }
             if (_strikeManager != null && !IsInRaid())
             {
@@ -48,6 +54,14 @@ namespace MortarStrikes
                 Log.LogWarning("[F9] Manual mortar strike");
                 _strikeManager.TriggerStrikeInstant();
             }
+        }
+
+        private void CreateStrikeManager(bool raidAlreadyStarted)
+        {
+            if (_strikeManager != null) return;
+            var go = new GameObject("MortarStrikeManager");
+            _strikeManager = go.AddComponent<MortarStrikeManager>();
+            _strikeManager.RaidAlreadyStarted = raidAlreadyStarted;
         }
 
         public static bool IsInRaid()

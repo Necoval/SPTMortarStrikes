@@ -40,6 +40,11 @@ namespace MortarStrikes
         private string _clientPatchInfo = "not patched";
         private string _flareInfo = "not checked";
 
+        /// <summary>
+        /// Set to true when created from FikaRaidStartedEvent (countdown finished). Skips initial delay.
+        /// </summary>
+        public bool RaidAlreadyStarted { get; set; }
+
         private void Start()
         {
             Instance = this;
@@ -895,7 +900,10 @@ namespace MortarStrikes
 
         private IEnumerator RaidLifecycle()
         {
-            yield return new WaitForSeconds(8f);
+            if (!RaidAlreadyStarted)
+            {
+                yield return new WaitForSeconds(8f);
+            }
             if (!Plugin.IsInRaid()) yield break;
 
             Plugin.ReloadConfig();
