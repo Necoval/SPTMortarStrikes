@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using BepInEx.Logging;
@@ -29,6 +30,8 @@ namespace MortarStrikes
         private object _betterAudio;
         private MethodInfo _playNonspatialMethod;
         private object _nonspatialGroup;
+        private bool _sirenIsCustom;
+        private AudioSource _sirenAudioSource;
         private bool _discoveryDone;
         private object _shellingController;
         private MethodInfo _startShellingMethod;
@@ -36,6 +39,11 @@ namespace MortarStrikes
         private bool _clientPatchApplied;
         private string _clientPatchInfo = "not patched";
         private string _flareInfo = "not checked";
+
+        /// <summary>
+        /// Set to true when created from FikaRaidStartedEvent (countdown finished). Skips initial delay.
+        /// </summary>
+        public bool RaidAlreadyStarted { get; set; }
 
         private void Start()
         {
@@ -52,12 +60,137 @@ namespace MortarStrikes
             if (Instance == this) Instance = null;
         }
 
+        private const int MinWavHeaderBytes = 44;
+        private const int MaxSirenWavBytes = 10 * 1024 * 1024;
+        private static string SirenPath => Path.Combine(BepInEx.Paths.PluginPath, "MortarStrikes", "Siren.wav");
+
+        private static AudioClip LoadWav(string path)
+        {
+            if (!File.Exists(path)) return null;
+            var fi = new FileInfo(path);
+            if (fi.Length > MaxSirenWavBytes || fi.Length < MinWavHeaderBytes) return null;
+
+            var bytes = File.ReadAllBytes(path);
+            if (bytes.Length < MinWavHeaderBytes) return null;
+            if (BitConverter.ToInt32(bytes, 0) != 0x46464952) return null; // RIFF
+            if (BitConverter.ToInt32(bytes, 8) != 0x45564157) return null; // WAVE
+
+            int format = 1;
+            int channels = 1;
+            int sampleRate = 44100;
+            int bitsPerSample = 16;
+            int dataIdx = -1;
+            int dataLen = 0;
+
+            int idx = 12;
+            for (int iter = 0; iter < 64 && idx <= bytes.Length - 8; iter++)
+            {
+                int chunkId = BitConverter.ToInt32(bytes, idx);
+                int chunkLen = BitConverter.ToInt32(bytes, idx + 4);
+                if (chunkLen < 0 || chunkLen > bytes.Length - idx - 8) break;
+
+                if (chunkId == 0x20746d66) // "fmt "
+                {
+                    if (chunkLen < 16) return null;
+                    format = BitConverter.ToInt16(bytes, idx + 8);
+                    channels = BitConverter.ToInt16(bytes, idx + 10);
+                    sampleRate = BitConverter.ToInt32(bytes, idx + 12);
+                    bitsPerSample = BitConverter.ToInt16(bytes, idx + 22);
+                }
+                else if (chunkId == 0x61746164) // "data"
+                {
+                    dataIdx = idx + 8;
+                    dataLen = Math.Min(chunkLen, bytes.Length - dataIdx);
+                    break;
+                }
+
+                // Word alignment: odd-length chunks include one padding byte.
+                idx += 8 + chunkLen + (chunkLen & 1);
+            }
+
+            if (dataIdx < 0 || dataLen <= 0 || channels <= 0 || sampleRate <= 0) return null;
+
+            int bytesPerSample = bitsPerSample / 8;
+            if (bytesPerSample <= 0) return null;
+            int totalSamples = dataLen / bytesPerSample;
+            int lengthInSamples = totalSamples / channels;
+            if (totalSamples <= 0 || lengthInSamples <= 0) return null;
+
+            var floats = new float[totalSamples];
+            if (format == 1) // PCM integer
+            {
+                if (bitsPerSample == 16)
+                {
+                    for (int i = 0; i < totalSamples; i++)
+                        floats[i] = BitConverter.ToInt16(bytes, dataIdx + i * 2) / 32768f;
+                }
+                else if (bitsPerSample == 24)
+                {
+                    for (int i = 0; i < totalSamples; i++)
+                    {
+                        int b0 = bytes[dataIdx + i * 3];
+                        int b1 = bytes[dataIdx + i * 3 + 1];
+                        int b2 = bytes[dataIdx + i * 3 + 2];
+                        int s24 = (b2 << 16) | (b1 << 8) | b0;
+                        if ((s24 & 0x800000) != 0) s24 |= unchecked((int)0xFF000000);
+                        floats[i] = s24 / 8388608f;
+                    }
+                }
+                else if (bitsPerSample == 32)
+                {
+                    for (int i = 0; i < totalSamples; i++)
+                        floats[i] = BitConverter.ToInt32(bytes, dataIdx + i * 4) / 2147483648f;
+                }
+                else return null;
+            }
+            else if (format == 3) // IEEE float
+            {
+                if (bitsPerSample != 32) return null;
+                for (int i = 0; i < totalSamples; i++)
+                    floats[i] = BitConverter.ToSingle(bytes, dataIdx + i * 4);
+            }
+            else return null;
+
+            var clip = AudioClip.Create(Path.GetFileNameWithoutExtension(path), lengthInSamples, channels, sampleRate, false);
+            clip.SetData(floats, 0);
+            if (Plugin.Log != null)
+                Plugin.Log.LogInfo($"[Mortar] LoadWav: '{path}' size={bytes.Length} format={format} {channels}ch {sampleRate}Hz {bitsPerSample}bit data={dataLen}B samples={lengthInSamples} len={clip.length:F2}s");
+            return clip;
+        }
+
+        private bool TryLoadCustomSiren()
+        {
+            if (!File.Exists(SirenPath)) return false;
+            try
+            {
+                var customClip = LoadWav(SirenPath);
+                if (customClip == null || customClip.length <= 0f)
+                {
+                    Log.LogWarning("[Mortar] Siren.wav invalid or empty. Falling back to config siren.");
+                    return false;
+                }
+
+                _sirenClip = customClip;
+                _sirenIsCustom = true;
+                _sirenInfo = $"Siren.wav ({_sirenClip.length:F1}s, {_sirenClip.channels}ch, {_sirenClip.frequency}Hz), loop={Cfg.SirenLoop}";
+                Log.LogInfo($"[Mortar] Siren: {_sirenInfo} [CUSTOM]");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[Mortar] Siren.wav load failed: {ex.Message}");
+                return false;
+            }
+        }
+
         private void SetupSiren()
         {
             if (_sirenReady) return;
             _sirenReady = true;
-
             SetupBetterAudio();
+            _sirenIsCustom = false;
+
+            if (TryLoadCustomSiren()) return;
 
             string wanted = Cfg.SirenClipName?.Trim() ?? "";
             if (!string.IsNullOrEmpty(wanted))
@@ -118,17 +251,20 @@ namespace MortarStrikes
             {
                 var asm = typeof(GameWorld).Assembly;
                 var baType = asm.GetTypes().FirstOrDefault(t => t.Name == "BetterAudio" && !t.Name.Contains("+"));
-                if (baType == null) return;
+                if (baType == null) { Log.LogWarning("[Mortar] BetterAudio type not found"); return; }
 
                 try { _betterAudio = typeof(Singleton<>).MakeGenericType(baType).GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null); } catch { }
                 if (_betterAudio == null) _betterAudio = FindObjectsOfType(baType).FirstOrDefault();
-                if (_betterAudio == null) return;
+                if (_betterAudio == null) { Log.LogWarning("[Mortar] BetterAudio instance not found"); return; }
 
                 _playNonspatialMethod = baType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
                     .FirstOrDefault(m => m.Name == "PlayNonspatial");
-                if (_playNonspatialMethod == null) return;
+                if (_playNonspatialMethod == null) { Log.LogWarning("[Mortar] PlayNonspatial method not found"); return; }
 
-                var gp = _playNonspatialMethod.GetParameters().FirstOrDefault(p => p.ParameterType.IsEnum);
+                var parms = _playNonspatialMethod.GetParameters();
+                if (Cfg.DebugMode) Log.LogInfo($"[Mortar] PlayNonspatial params: {string.Join(", ", parms.Select(p => $"{p.ParameterType.Name} {p.Name}"))}");
+
+                var gp = parms.FirstOrDefault(p => p.ParameterType.IsEnum);
                 if (gp != null)
                 {
                     var enumType = gp.ParameterType;
@@ -146,7 +282,20 @@ namespace MortarStrikes
 
         private void PlayClip(AudioClip clip)
         {
-            if (_betterAudio == null || _playNonspatialMethod == null || clip == null) return;
+            if (clip == null) { Log.LogWarning("[Mortar] PlayClip: clip is null"); return; }
+
+            if (_sirenIsCustom)
+            {
+                PlayClipViaAudioSource(clip);
+                return;
+            }
+
+            if (_betterAudio == null || _playNonspatialMethod == null)
+            {
+                Log.LogWarning("[Mortar] PlayClip: BetterAudio not ready, falling back to AudioSource");
+                PlayClipViaAudioSource(clip);
+                return;
+            }
             try
             {
                 var parms = _playNonspatialMethod.GetParameters();
@@ -161,41 +310,61 @@ namespace MortarStrikes
                     else if (p.HasDefaultValue) args[i] = p.DefaultValue;
                     else args[i] = null;
                 }
+                if (Cfg.DebugMode) Log.LogInfo($"[Mortar] PlayClip BetterAudio Invoke: clip={clip.name}, vol={Cfg.SirenVolume}");
                 _playNonspatialMethod.Invoke(_betterAudio, args);
             }
-            catch (Exception ex) { Log.LogError($"[Mortar] PlayNonspatial: {ex.InnerException?.Message ?? ex.Message}"); }
+            catch (Exception ex) { Log.LogError($"[Mortar] PlayNonspatial failed: {ex.InnerException?.Message ?? ex.Message}, falling back to AudioSource"); PlayClipViaAudioSource(clip); }
+        }
+
+        private void PlayClipViaAudioSource(AudioClip clip)
+        {
+            if (clip == null) return;
+            if (_sirenAudioSource == null)
+            {
+                _sirenAudioSource = gameObject.AddComponent<AudioSource>();
+                _sirenAudioSource.spatialBlend = 0f;
+                _sirenAudioSource.playOnAwake = false;
+                Log.LogInfo("[Mortar] Created AudioSource for siren playback");
+            }
+            _sirenAudioSource.PlayOneShot(clip, Cfg.SirenVolume);
+            if (Cfg.DebugMode) Log.LogInfo($"[Mortar] PlayClipViaAudioSource: '{clip.name}' vol={Cfg.SirenVolume}");
         }
 
         public void PlaySiren(bool force = false)
         {
-            if (!Cfg.SirenEnabled) return;
+            if (!Cfg.SirenEnabled) { if (Cfg.DebugMode) Log.LogInfo("[Mortar] PlaySiren: siren disabled in config"); return; }
             if (!_sirenReady) SetupSiren();
-            if (_sirenClip == null) return;
+            if (_sirenClip == null) { Log.LogWarning("[Mortar] PlaySiren: no clip (null)"); return; }
 
             if (!force && _sirenPlayedForStrike)
             {
-                if (Cfg.DebugMode) Log.LogInfo($"[Mortar] Siren BLOCKED (already played for this strike)");
+                if (Cfg.DebugMode) Log.LogInfo("[Mortar] Siren BLOCKED (already played for this strike)");
                 return;
             }
             _sirenPlayedForStrike = true;
 
             _sirenPlaying = true;
-            Log.LogInfo($"[Mortar] Siren PLAY: '{_sirenClip.name}', loop={Cfg.SirenLoop}, forced={force}");
+            Log.LogInfo($"[Mortar] Siren PLAY: '{_sirenClip.name}' len={_sirenClip.length:F1}s loop={Cfg.SirenLoop} custom={_sirenIsCustom} forced={force}");
             PlayClip(_sirenClip);
 
-            if (Cfg.SirenLoop && _sirenClip.length < Cfg.SirenDurationSeconds)
+            if (Cfg.SirenLoop)
                 _sirenLoopCo = StartCoroutine(SirenLoopCoroutine());
         }
 
         private IEnumerator SirenLoopCoroutine()
         {
             float clipLen = _sirenClip.length;
+            float duration = Cfg.SirenDurationSeconds;
+            float elapsed = 0f;
             yield return new WaitForSeconds(clipLen - 0.1f);
-            while (_sirenPlaying && _sirenClip != null)
+            elapsed += clipLen;
+            while (_sirenPlaying && _sirenClip != null && elapsed < duration)
             {
                 PlayClip(_sirenClip);
                 yield return new WaitForSeconds(clipLen - 0.1f);
+                elapsed += clipLen;
             }
+            _sirenPlaying = false;
         }
 
         private void StopSiren()
@@ -320,7 +489,16 @@ namespace MortarStrikes
 
         private bool SpawnBarrage(Vector3 position)
         {
-            if (_startShellingMethod == null) { Log.LogError("[Mortar] No artillery!"); return false; }
+            if (_startShellingMethod == null)
+            {
+                Log.LogError("[Mortar] SpawnBarrage FAILED: _startShellingMethod is null (artillery not discovered)");
+                return false;
+            }
+            if (_shellingController == null)
+            {
+                Log.LogError("[Mortar] SpawnBarrage FAILED: _shellingController is null");
+                return false;
+            }
             try
             {
                 _startShellingMethod.Invoke(_shellingController, new object[] { position });
@@ -329,7 +507,7 @@ namespace MortarStrikes
             }
             catch (Exception ex)
             {
-                Log.LogError($"[Mortar] Artillery FAILED: {ex.InnerException?.Message ?? ex.Message}");
+                Log.LogError($"[Mortar] SpawnBarrage FAILED: {ex.InnerException?.Message ?? ex.Message}\n{ex.StackTrace}");
                 return false;
             }
         }
@@ -618,7 +796,14 @@ namespace MortarStrikes
             var gw = Singleton<GameWorld>.Instance;
             if (gw == null) yield break;
             var alive = gw.AllAlivePlayersList;
-            if (alive == null || alive.Count == 0) yield break;
+            if (alive == null) yield break;
+            for (int waitRetry = 0; alive.Count == 0 && Plugin.IsInRaid() && waitRetry < 4; waitRetry++)
+            {
+                yield return new WaitForSeconds(30f);
+                alive = gw.AllAlivePlayersList;
+                if (alive == null) yield break;
+            }
+            if (alive.Count == 0) yield break;
 
             Player target = null;
             int weight = Math.Max(0, Math.Min(100, Cfg.PlayerTargetingWeight));
@@ -661,34 +846,30 @@ namespace MortarStrikes
 
             Log.LogInfo($"[Mortar] === STRIKE #{_strikesThisRaid + 1} === Target: {tName}, center: {sc}");
 
+            // Fire barrage early so impacts land near warningTime (game has built-in fly time)
+            float flyTime = Mathf.Max(0f, Cfg.ArtilleryFlyTimeSeconds);
+            float randMax = Mathf.Max(0f, Cfg.ArtilleryFlyTimeRandom);
+            float flyRandom = (flyTime > 0f && randMax > 0f) ? UnityEngine.Random.Range(0f, randMax) : 0f;
+            float fireDelay = Mathf.Max(0f, Cfg.WarningDelaySeconds - (flyTime + flyRandom));
+
             if (withSiren)
             {
-                bool warned = false;
-                float warningTime = Cfg.WarningDelaySeconds;
-
                 if (Cfg.WarningFlareEnabled)
-                {
-                    if (SpawnWarningFlare(sc, tp.y))
-                    {
-                        warned = true;
-                        Log.LogInfo($"[Mortar] Warning flare launched! Barrage in {warningTime:F0}s...");
-                    }
-                }
+                    SpawnWarningFlare(sc, tp.y);
 
                 if (Cfg.SirenEnabled)
                 {
                     _sirenPlayedForStrike = false;
                     PlaySiren(force: true);
                     FikaSync.BroadcastSirenPacket(sc.x, sc.y, sc.z);
-                    warned = true;
                 }
 
-                if (warned)
+                if (fireDelay > 0f)
                 {
-                    yield return new WaitForSeconds(warningTime);
-                    StopSiren();
-                    yield return new WaitForSeconds(UnityEngine.Random.Range(0.5f, 2f));
+                    Log.LogInfo($"[Mortar] Barrage in ~{Cfg.WarningDelaySeconds:F0}s (firing in {fireDelay:F0}s, fly {flyTime + flyRandom:F0}s)");
+                    yield return new WaitForSeconds(fireDelay);
                 }
+                yield return new WaitForSeconds(UnityEngine.Random.Range(0.5f, 2f));
             }
 
             if (!Plugin.IsInRaid()) yield break;
@@ -719,7 +900,10 @@ namespace MortarStrikes
 
         private IEnumerator RaidLifecycle()
         {
-            yield return new WaitForSeconds(8f);
+            if (!RaidAlreadyStarted)
+            {
+                yield return new WaitForSeconds(8f);
+            }
             if (!Plugin.IsInRaid()) yield break;
 
             Plugin.ReloadConfig();
@@ -733,7 +917,6 @@ namespace MortarStrikes
             Log.LogInfo($"[Mortar] Map: {_mapId} | Host: {_isHost}");
 
             RunDiscovery();
-            SetupSiren();
             LogAllClips();
 
             FikaSync.TryRegisterPacket();
@@ -753,6 +936,7 @@ namespace MortarStrikes
             yield return new WaitForSeconds(delay);
 
             if (!Plugin.IsInRaid()) yield break;
+
             yield return StartCoroutine(ExecuteStrike(withSiren: true));
 
             while (Cfg.AllowMultipleStrikes && _strikesThisRaid < Cfg.MaxStrikesPerRaid && Plugin.IsInRaid())

@@ -16,8 +16,11 @@ namespace MortarStrikes
         private static bool _fikaAvailable;
         private static bool _packetRegistered;
         private static bool _packetRegistrationAttempted;
+        private static Action _raidStartedCallback;
+        private static bool _raidStartedSubscribed;
         private static Assembly _fikaAsm;
         private static PropertyInfo _isServerProp;
+        private static PropertyInfo _isInRaidProp;
         private static PropertyInfo _networkManagerSingletonProp;
         private static Type _packetType;
         private static FieldInfo _fxField;
@@ -46,6 +49,8 @@ namespace MortarStrikes
 
                 var utilsType = _fikaAsm.GetTypes()
                     .FirstOrDefault(t => t.Name == "FikaBackendUtils");
+                var globalsType = _fikaAsm.GetTypes()
+                    .FirstOrDefault(t => t.Name == "FikaGlobals");
 
                 if (utilsType != null)
                 {
@@ -59,6 +64,9 @@ namespace MortarStrikes
                                 .Select(p => p.Name)));
                     }
                 }
+
+                if (globalsType != null)
+                    _isInRaidProp = globalsType.GetProperty("IsInRaid", BindingFlags.Public | BindingFlags.Static);
 
                 var ifikaType = FindTypeInAllAssemblies("IFikaNetworkManager");
                 if (ifikaType != null)
@@ -84,6 +92,64 @@ namespace MortarStrikes
             return _fikaAvailable;
         }
 
+        /// <summary>
+        /// Subscribe to FikaRaidStartedEvent (fires when countdown ends, raid actually starts).
+        /// Returns true if subscribed; false if Fika not available (use Update/IsInRaid fallback).
+        /// </summary>
+        public static bool TrySubscribeRaidStarted(Action onRaidStarted)
+        {
+            if (!_fikaAvailable || _raidStartedSubscribed || onRaidStarted == null) return false;
+            try
+            {
+                var dispatcherType = _fikaAsm.GetType("Fika.Core.Modding.FikaEventDispatcher");
+                var eventType = _fikaAsm.GetType("Fika.Core.Modding.Events.FikaRaidStartedEvent");
+                if (dispatcherType == null || eventType == null)
+                {
+                    Log.LogWarning("[Mortar] FIKA: FikaEventDispatcher or FikaRaidStartedEvent not found.");
+                    return false;
+                }
+
+                _raidStartedCallback = onRaidStarted;
+                var subscribeMethod = dispatcherType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "SubscribeEvent" && m.IsGenericMethod && m.GetGenericArguments().Length == 1);
+                if (subscribeMethod == null)
+                {
+                    Log.LogWarning("[Mortar] FIKA: SubscribeEvent not found.");
+                    return false;
+                }
+
+                var genericSubscribe = subscribeMethod.MakeGenericMethod(eventType);
+                var delegateType = typeof(Action<>).MakeGenericType(eventType);
+                var trampoline = CreateRaidStartedTrampoline(eventType);
+                var handler = Delegate.CreateDelegate(delegateType, trampoline);
+
+                genericSubscribe.Invoke(null, new object[] { handler });
+                _raidStartedSubscribed = true;
+                Log.LogInfo("[Mortar] FIKA: Subscribed to FikaRaidStartedEvent.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.LogError($"[Mortar] FIKA: RaidStarted subscription failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static DynamicMethod CreateRaidStartedTrampoline(Type eventType)
+        {
+            var dm = new DynamicMethod("RaidStartedTrampoline", typeof(void), new[] { eventType }, typeof(FikaSync), true);
+            var il = dm.GetILGenerator();
+            var retLabel = il.DefineLabel();
+            var callbackField = typeof(FikaSync).GetField("_raidStartedCallback", BindingFlags.Static | BindingFlags.NonPublic);
+            il.Emit(OpCodes.Ldsfld, callbackField);
+            il.Emit(OpCodes.Brfalse_S, retLabel);
+            il.Emit(OpCodes.Ldsfld, callbackField);
+            il.Emit(OpCodes.Callvirt, typeof(Action).GetMethod("Invoke"));
+            il.MarkLabel(retLabel);
+            il.Emit(OpCodes.Ret);
+            return dm;
+        }
+
         public static bool IsServer()
         {
             if (!_fikaAvailable) return true;
@@ -93,6 +159,22 @@ namespace MortarStrikes
                 catch { }
             }
             return true;
+        }
+
+        /// <summary>
+        /// When FIKA is present (including headless), use FikaGlobals.IsInRaid instead of MainPlayer.
+        /// Returns true if we got a value from FIKA; false means use the caller's fallback (GameWorld+MainPlayer).
+        /// </summary>
+        public static bool TryGetFikaIsInRaid(out bool isInRaid)
+        {
+            isInRaid = false;
+            if (!_fikaAvailable || _isInRaidProp == null) return false;
+            try
+            {
+                isInRaid = (bool)_isInRaidProp.GetValue(null);
+                return true;
+            }
+            catch { return false; }
         }
 
         public static void TryRegisterPacket()
