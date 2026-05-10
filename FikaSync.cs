@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -11,6 +12,9 @@ namespace MortarStrikes
     /// </summary>
     public static class FikaSync
     {
+        private const string MinSupportedFikaPlugin = "2.2.4";
+        private const string MinSupportedFikaHeadless = "1.4.13";
+
         private static ManualLogSource Log => Plugin.Log;
         private static bool _initDone;
         private static bool _fikaAvailable;
@@ -19,14 +23,32 @@ namespace MortarStrikes
         private static Action _raidStartedCallback;
         private static bool _raidStartedSubscribed;
         private static Assembly _fikaAsm;
+        private static Type _eventDispatcherType;
+        private static Type _raidStartedEventType;
+        private static MethodInfo _subscribeEventMethod;
         private static PropertyInfo _isServerProp;
         private static PropertyInfo _isInRaidProp;
         private static PropertyInfo _networkManagerSingletonProp;
+        private static MethodInfo _getPeerByIdMethod;
         private static Type _packetType;
         private static FieldInfo _fxField;
         private static FieldInfo _fyField;
         private static FieldInfo _fzField;
         private static MethodInfo _sendDataResolved;
+
+        private static void DisableFikaIntegration(string reason, bool warn)
+        {
+            _fikaAvailable = false;
+            _packetRegistered = false;
+            _packetRegistrationAttempted = false;
+            _sendDataResolved = null;
+
+            string message = $"[Mortar] FIKA disabled ({reason}). Falling back to non-FIKA mode.";
+            if (warn)
+                Log.LogWarning(message);
+            else
+                Log.LogInfo(message);
+        }
 
         public static bool Init()
         {
@@ -40,7 +62,7 @@ namespace MortarStrikes
 
                 if (_fikaAsm == null)
                 {
-                    Log.LogInfo("[Mortar] FIKA not detected — running solo/host mode.");
+                    DisableFikaIntegration("Fika.Core not detected", warn: false);
                     return false;
                 }
 
@@ -51,42 +73,26 @@ namespace MortarStrikes
                     .FirstOrDefault(t => t.Name == "FikaBackendUtils");
                 var globalsType = _fikaAsm.GetTypes()
                     .FirstOrDefault(t => t.Name == "FikaGlobals");
-
-                if (utilsType != null)
-                {
-                    _isServerProp = utilsType.GetProperty("IsServer", BindingFlags.Public | BindingFlags.Static);
-                    if (_isServerProp != null)
-                        Log.LogInfo($"[Mortar] FIKA: Found {utilsType.FullName}.IsServer");
-                    else
-                    {
-                        Log.LogWarning("[Mortar] FIKA: IsServer not found. Static props: "
-                            + string.Join(", ", utilsType.GetProperties(BindingFlags.Public | BindingFlags.Static)
-                                .Select(p => p.Name)));
-                    }
-                }
-
-                if (globalsType != null)
-                    _isInRaidProp = globalsType.GetProperty("IsInRaid", BindingFlags.Public | BindingFlags.Static);
-
                 var ifikaType = FindTypeInAllAssemblies("IFikaNetworkManager");
-                if (ifikaType != null)
+
+                if (!ValidateRequiredFikaSurface(utilsType, globalsType, ifikaType))
                 {
-                    var singletonType = typeof(Comfort.Common.Singleton<>).MakeGenericType(ifikaType);
-                    _networkManagerSingletonProp = singletonType.GetProperty("Instance",
-                        BindingFlags.Public | BindingFlags.Static);
-                    if (_networkManagerSingletonProp != null)
-                        Log.LogInfo("[Mortar] FIKA: Singleton<IFikaNetworkManager> accessor cached");
-                }
-                else
-                {
-                    Log.LogWarning("[Mortar] FIKA: IFikaNetworkManager type not found.");
+                    DisableFikaIntegration("incompatible FIKA API surface", warn: true);
+                    return false;
                 }
 
                 BuildPacketType();
+                if (_packetType == null || _fxField == null || _fyField == null || _fzField == null)
+                {
+                    Log.LogError("[Mortar] FIKA: Packet type build failed. Disabling FIKA integration for this session.");
+                    DisableFikaIntegration("packet setup failed", warn: true);
+                    return false;
+                }
             }
             catch (Exception ex)
             {
                 Log.LogError($"[Mortar] FIKA init error: {ex}");
+                DisableFikaIntegration("init exception", warn: true);
             }
 
             return _fikaAvailable;
@@ -101,8 +107,8 @@ namespace MortarStrikes
             if (!_fikaAvailable || _raidStartedSubscribed || onRaidStarted == null) return false;
             try
             {
-                var dispatcherType = _fikaAsm.GetType("Fika.Core.Modding.FikaEventDispatcher");
-                var eventType = _fikaAsm.GetType("Fika.Core.Modding.Events.FikaRaidStartedEvent");
+                var dispatcherType = _eventDispatcherType ?? _fikaAsm.GetType("Fika.Core.Modding.FikaEventDispatcher");
+                var eventType = _raidStartedEventType ?? _fikaAsm.GetType("Fika.Core.Modding.Events.FikaRaidStartedEvent");
                 if (dispatcherType == null || eventType == null)
                 {
                     Log.LogWarning("[Mortar] FIKA: FikaEventDispatcher or FikaRaidStartedEvent not found.");
@@ -110,7 +116,7 @@ namespace MortarStrikes
                 }
 
                 _raidStartedCallback = onRaidStarted;
-                var subscribeMethod = dispatcherType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                var subscribeMethod = _subscribeEventMethod ?? dispatcherType.GetMethods(BindingFlags.Public | BindingFlags.Static)
                     .FirstOrDefault(m => m.Name == "SubscribeEvent" && m.IsGenericMethod && m.GetGenericArguments().Length == 1);
                 if (subscribeMethod == null)
                 {
@@ -133,6 +139,112 @@ namespace MortarStrikes
                 Log.LogError($"[Mortar] FIKA: RaidStarted subscription failed: {ex.Message}");
                 return false;
             }
+        }
+
+        private static bool ValidateRequiredFikaSurface(Type utilsType, Type globalsType, Type ifikaType)
+        {
+            var missing = new List<string>();
+
+            if (utilsType == null)
+            {
+                missing.Add("FikaBackendUtils type");
+            }
+            else
+            {
+                _isServerProp = utilsType.GetProperty("IsServer", BindingFlags.Public | BindingFlags.Static);
+                if (_isServerProp == null)
+                    missing.Add("FikaBackendUtils.IsServer");
+            }
+
+            if (globalsType == null)
+            {
+                missing.Add("FikaGlobals type");
+            }
+            else
+            {
+                _isInRaidProp = globalsType.GetProperty("IsInRaid", BindingFlags.Public | BindingFlags.Static);
+                if (_isInRaidProp == null)
+                    missing.Add("FikaGlobals.IsInRaid");
+            }
+
+            _eventDispatcherType = _fikaAsm.GetType("Fika.Core.Modding.FikaEventDispatcher");
+            if (_eventDispatcherType == null)
+                missing.Add("FikaEventDispatcher type");
+
+            _raidStartedEventType = _fikaAsm.GetType("Fika.Core.Modding.Events.FikaRaidStartedEvent");
+            if (_raidStartedEventType == null)
+                missing.Add("FikaRaidStartedEvent type");
+
+            if (_eventDispatcherType != null)
+            {
+                _subscribeEventMethod = _eventDispatcherType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m =>
+                        m.Name == "SubscribeEvent"
+                        && m.IsGenericMethodDefinition
+                        && m.GetGenericArguments().Length == 1
+                        && m.GetParameters().Length == 1);
+
+                if (_subscribeEventMethod == null)
+                    missing.Add("FikaEventDispatcher.SubscribeEvent<T>(Action<T>)");
+            }
+
+            if (ifikaType == null)
+            {
+                missing.Add("IFikaNetworkManager type");
+            }
+            else
+            {
+                var singletonType = typeof(Comfort.Common.Singleton<>).MakeGenericType(ifikaType);
+                _networkManagerSingletonProp = singletonType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+                if (_networkManagerSingletonProp == null)
+                    missing.Add("Singleton<IFikaNetworkManager>.Instance");
+
+                _getPeerByIdMethod = ifikaType.GetMethod(
+                    "GetPeerById",
+                    BindingFlags.Public | BindingFlags.Instance,
+                    null,
+                    new[] { typeof(int) },
+                    null);
+
+                if (_getPeerByIdMethod == null)
+                    missing.Add("IFikaNetworkManager.GetPeerById(int)");
+
+                var registerMethod = ifikaType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(m =>
+                        m.Name == "RegisterPacket"
+                        && m.IsGenericMethodDefinition
+                        && m.GetGenericArguments().Length == 1
+                        && m.GetParameters().Length == 1);
+
+                if (registerMethod == null)
+                    missing.Add("IFikaNetworkManager.RegisterPacket<T>(Action<T>)");
+
+                var sendMethod = ifikaType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(m =>
+                        m.Name == "SendData"
+                        && m.IsGenericMethodDefinition
+                        && m.GetGenericArguments().Length == 1
+                        && m.GetParameters().Length >= 2);
+
+                if (sendMethod == null)
+                    missing.Add("IFikaNetworkManager.SendData<T>(...)");
+            }
+
+            if (missing.Count > 0)
+            {
+                Log.LogError("[Mortar] FIKA compatibility check failed. Unsupported FIKA stack for this build.");
+                Log.LogError($"[Mortar] Required minimum: Fika Plugin >= {MinSupportedFikaPlugin}, Fika Headless >= {MinSupportedFikaHeadless}.");
+                Log.LogError("[Mortar] Missing API surface: " + string.Join("; ", missing));
+                return false;
+            }
+
+            Log.LogInfo($"[Mortar] FIKA compatibility check passed (Plugin >= {MinSupportedFikaPlugin}, Headless >= {MinSupportedFikaHeadless}).");
+            Log.LogInfo("[Mortar] FIKA: Singleton<IFikaNetworkManager> accessor cached");
+            Log.LogInfo("[Mortar] FIKA: IFikaNetworkManager.GetPeerById(int) detected");
+            return true;
         }
 
         private static DynamicMethod CreateRaidStartedTrampoline(Type eventType)
