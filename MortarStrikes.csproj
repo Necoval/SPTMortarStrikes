@@ -12,7 +12,7 @@
 
   <PropertyGroup>
     <BuildRoot Condition="'$(BuildRoot)' == ''">$(MSBuildThisFileDirectory)Build</BuildRoot>
-    <CoreRefDir Condition="'$(CoreRefDir)' == ''">$(BuildRoot)\Lib\Fika-Headless-1.4.13\Fika-Headless-1.4.13\References\</CoreRefDir>
+    <CoreRefDir Condition="'$(CoreRefDir)' == ''">$(BuildRoot)\Lib\Fika-Headless-1.4.15\References\</CoreRefDir>
     <BepInExCoreDir Condition="'$(BepInExCoreDir)' == ''">$(BuildRoot)\Lib\spt-4.0.12\static-assets-csharp\BepInEx\core\</BepInExCoreDir>
     <DecompLibDir Condition="'$(DecompLibDir)' == ''">$(MSBuildThisFileDirectory)..\BringMeToLifeMod\Build\Decomp\Assembly-CSharp\lib\</DecompLibDir>
   </PropertyGroup>
@@ -48,7 +48,7 @@
   </ItemGroup>
 
   <Target Name="ValidateReferenceInputs" BeforeTargets="ResolveReferences">
-    <Error Condition="!Exists('$(CoreRefDir)Fika.Core.dll')" Text="Missing Fika.Core.dll at $(CoreRefDir). Expected local Fika Headless 1.4.13 references." />
+    <Error Condition="!Exists('$(CoreRefDir)Fika.Core.dll')" Text="Missing Fika.Core.dll at $(CoreRefDir). Expected local Fika Headless 1.4.15 references." />
     <Error Condition="!Exists('$(CoreRefDir)hollowed.dll')" Text="Missing hollowed.dll at $(CoreRefDir)." />
     <Error Condition="!Exists('$(CoreRefDir)spt-reflection.dll')" Text="Missing spt-reflection.dll at $(CoreRefDir)." />
     <Error Condition="!Exists('$(BepInExCoreDir)BepInEx.dll')" Text="Missing BepInEx.dll at $(BepInExCoreDir)." />

@@ -33,6 +33,12 @@ namespace MortarStrikes
             _fikaRaidStartedSubscribed = FikaSync.TrySubscribeRaidStarted(OnFikaRaidStarted);
         }
 
+        private void OnDestroy()
+        {
+            FikaSync.Shutdown();
+            _fikaRaidStartedSubscribed = false;
+        }
+
         private void OnFikaRaidStarted()
         {
             CreateStrikeManager(raidAlreadyStarted: true);

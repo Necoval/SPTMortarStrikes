@@ -12,8 +12,11 @@ namespace MortarStrikes
     /// </summary>
     public static class FikaSync
     {
-        private const string MinSupportedFikaPlugin = "2.2.4";
-        private const string MinSupportedFikaHeadless = "1.4.13";
+        private const string MinSupportedFikaPlugin = "2.3.8";
+        private const string MinSupportedFikaHeadless = "1.4.15";
+        // Plugin 2.3.8 hard-requires Fika Server C# >= 2.3.5 (FikaPlugin._requiredServerVersion).
+        // A mismatched plugin/server pair refuses to connect; that is a deployment issue, not a mod bug.
+        private const string MinSupportedFikaServer = "2.3.5";
 
         private static ManualLogSource Log => Plugin.Log;
         private static bool _initDone;
@@ -22,10 +25,18 @@ namespace MortarStrikes
         private static bool _packetRegistrationAttempted;
         private static Action _raidStartedCallback;
         private static bool _raidStartedSubscribed;
+        private static Delegate _raidStartedHandler;
+        private static bool _networkManagerCreatedSubscribed;
+        private static Delegate _networkManagerCreatedHandler;
         private static Assembly _fikaAsm;
         private static Type _eventDispatcherType;
         private static Type _raidStartedEventType;
+        private static Type _networkManagerCreatedEventType;
+        private static PropertyInfo _networkManagerCreatedManagerProp;
         private static MethodInfo _subscribeEventMethod;
+        private static MethodInfo _unsubscribeEventMethod;
+        private static PropertyInfo _downedProp;
+        private static Type _downedDeclaringType;
         private static PropertyInfo _isServerProp;
         private static PropertyInfo _isInRaidProp;
         private static PropertyInfo _networkManagerSingletonProp;
@@ -73,7 +84,7 @@ namespace MortarStrikes
                     .FirstOrDefault(t => t.Name == "FikaBackendUtils");
                 var globalsType = _fikaAsm.GetTypes()
                     .FirstOrDefault(t => t.Name == "FikaGlobals");
-                var ifikaType = FindTypeInAllAssemblies("IFikaNetworkManager");
+                var ifikaType = FindFikaType("IFikaNetworkManager");
 
                 if (!ValidateRequiredFikaSurface(utilsType, globalsType, ifikaType))
                 {
@@ -88,6 +99,8 @@ namespace MortarStrikes
                     DisableFikaIntegration("packet setup failed", warn: true);
                     return false;
                 }
+
+                TrySubscribeNetworkManagerCreated();
             }
             catch (Exception ex)
             {
@@ -130,6 +143,7 @@ namespace MortarStrikes
                 var handler = Delegate.CreateDelegate(delegateType, trampoline);
 
                 genericSubscribe.Invoke(null, new object[] { handler });
+                _raidStartedHandler = handler;
                 _raidStartedSubscribed = true;
                 Log.LogInfo("[Mortar] FIKA: Subscribed to FikaRaidStartedEvent.");
                 return true;
@@ -139,6 +153,82 @@ namespace MortarStrikes
                 Log.LogError($"[Mortar] FIKA: RaidStarted subscription failed: {ex.Message}");
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Registers the siren packet off FikaNetworkManagerCreatedEvent, which carries the
+        /// IFikaNetworkManager directly. Fika 2.3.4 made FikaClient.Init() await packet registration, and this
+        /// is the registration point that timing fix assumes — registering later (from the post-raid-start
+        /// coroutine) can miss the window on a joining client.
+        /// </summary>
+        private static void TrySubscribeNetworkManagerCreated()
+        {
+            if (_networkManagerCreatedSubscribed) return;
+            if (_networkManagerCreatedEventType == null || _networkManagerCreatedManagerProp == null) return;
+
+            try
+            {
+                var handler = CreateEventHandler(
+                    _networkManagerCreatedEventType,
+                    "NetworkManagerCreatedTrampoline",
+                    nameof(OnNetworkManagerCreatedInternal));
+
+                if (handler == null) return;
+
+                _networkManagerCreatedHandler = handler;
+                _subscribeEventMethod
+                    .MakeGenericMethod(_networkManagerCreatedEventType)
+                    .Invoke(null, new object[] { handler });
+
+                _networkManagerCreatedSubscribed = true;
+                Log.LogInfo("[Mortar] FIKA: Subscribed to FikaNetworkManagerCreatedEvent for packet registration.");
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[Mortar] FIKA: NetworkManagerCreated subscription failed ({ex.Message}). Falling back to raid-start registration.");
+            }
+        }
+
+        public static void OnNetworkManagerCreatedInternal(object evt)
+        {
+            try
+            {
+                var manager = _networkManagerCreatedManagerProp.GetValue(evt);
+                if (manager == null)
+                {
+                    Log.LogWarning("[Mortar] FIKA: NetworkManagerCreated fired with a null Manager.");
+                    return;
+                }
+
+                // A new network manager means a new raid session — drop any state from the previous one.
+                _packetRegistered = false;
+                _packetRegistrationAttempted = false;
+                _sendDataResolved = null;
+
+                RegisterPacketOn(manager);
+            }
+            catch (Exception ex)
+            {
+                Log.LogError($"[Mortar] FIKA: NetworkManagerCreated handler error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Builds an Action&lt;TEvent&gt; that forwards the event instance to a static FikaSync handler.
+        /// </summary>
+        private static Delegate CreateEventHandler(Type eventType, string trampolineName, string targetMethodName)
+        {
+            var target = typeof(FikaSync).GetMethod(targetMethodName, BindingFlags.Static | BindingFlags.Public);
+            if (target == null) return null;
+
+            var dm = new DynamicMethod(trampolineName, typeof(void), new[] { eventType }, typeof(FikaSync), true);
+            var il = dm.GetILGenerator();
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Castclass, typeof(object));
+            il.Emit(OpCodes.Call, target);
+            il.Emit(OpCodes.Ret);
+
+            return dm.CreateDelegate(typeof(Action<>).MakeGenericType(eventType));
         }
 
         private static bool ValidateRequiredFikaSurface(Type utilsType, Type globalsType, Type ifikaType)
@@ -175,6 +265,21 @@ namespace MortarStrikes
             if (_raidStartedEventType == null)
                 missing.Add("FikaRaidStartedEvent type");
 
+            // Fika 2.3.4 made FikaClient.Init() await packet registration; custom packets are meant to be
+            // registered off this event rather than by polling Singleton<IFikaNetworkManager>.Instance.
+            _networkManagerCreatedEventType = _fikaAsm.GetType("Fika.Core.Modding.Events.FikaNetworkManagerCreatedEvent");
+            if (_networkManagerCreatedEventType == null)
+            {
+                missing.Add("FikaNetworkManagerCreatedEvent type");
+            }
+            else
+            {
+                _networkManagerCreatedManagerProp = _networkManagerCreatedEventType
+                    .GetProperty("Manager", BindingFlags.Public | BindingFlags.Instance);
+                if (_networkManagerCreatedManagerProp == null)
+                    missing.Add("FikaNetworkManagerCreatedEvent.Manager");
+            }
+
             if (_eventDispatcherType != null)
             {
                 _subscribeEventMethod = _eventDispatcherType
@@ -187,6 +292,15 @@ namespace MortarStrikes
 
                 if (_subscribeEventMethod == null)
                     missing.Add("FikaEventDispatcher.SubscribeEvent<T>(Action<T>)");
+
+                // Optional: teardown hygiene only, so a missing overload is not a compatibility failure.
+                _unsubscribeEventMethod = _eventDispatcherType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m =>
+                        m.Name == "UnsubscribeEvent"
+                        && m.IsGenericMethodDefinition
+                        && m.GetGenericArguments().Length == 1
+                        && m.GetParameters().Length == 1);
             }
 
             if (ifikaType == null)
@@ -236,12 +350,20 @@ namespace MortarStrikes
             if (missing.Count > 0)
             {
                 Log.LogError("[Mortar] FIKA compatibility check failed. Unsupported FIKA stack for this build.");
-                Log.LogError($"[Mortar] Required minimum: Fika Plugin >= {MinSupportedFikaPlugin}, Fika Headless >= {MinSupportedFikaHeadless}.");
+                Log.LogError($"[Mortar] Required minimum: Fika Plugin >= {MinSupportedFikaPlugin}, Fika Headless >= {MinSupportedFikaHeadless}, Fika Server C# >= {MinSupportedFikaServer}.");
                 Log.LogError("[Mortar] Missing API surface: " + string.Join("; ", missing));
                 return false;
             }
 
-            Log.LogInfo($"[Mortar] FIKA compatibility check passed (Plugin >= {MinSupportedFikaPlugin}, Headless >= {MinSupportedFikaHeadless}).");
+            // Cheap positive signal that this is a 2.3.x IFikaNetworkManager: StrictInventorySync was the only
+            // member added between 2.2.4 and 2.3.8, so the rest of the interface can't tell the versions apart.
+            if (ifikaType.GetProperty("StrictInventorySync", BindingFlags.Public | BindingFlags.Instance) != null)
+                Log.LogInfo("[Mortar] FIKA: IFikaNetworkManager.StrictInventorySync present — 2.3.x interface confirmed.");
+            else
+                Log.LogWarning($"[Mortar] FIKA: IFikaNetworkManager.StrictInventorySync missing — this looks like a pre-2.3.x Fika. Expected Plugin >= {MinSupportedFikaPlugin}; continuing, but this stack is untested.");
+
+            Log.LogInfo($"[Mortar] FIKA compatibility check passed (Plugin >= {MinSupportedFikaPlugin}, Headless >= {MinSupportedFikaHeadless}, Server C# >= {MinSupportedFikaServer}).");
+            Log.LogInfo($"[Mortar] FIKA: Plugin and Fika Server C# versions must be paired — Plugin {MinSupportedFikaPlugin} refuses a server older than {MinSupportedFikaServer}.");
             Log.LogInfo("[Mortar] FIKA: Singleton<IFikaNetworkManager> accessor cached");
             Log.LogInfo("[Mortar] FIKA: IFikaNetworkManager.GetPeerById(int) detected");
             return true;
@@ -289,20 +411,33 @@ namespace MortarStrikes
             catch { return false; }
         }
 
+        /// <summary>
+        /// Fallback registration path for when FikaNetworkManagerCreatedEvent never reached us (older stack, or
+        /// the manager was created before Init ran). Preferred path is OnNetworkManagerCreatedInternal.
+        /// </summary>
         public static void TryRegisterPacket()
         {
             if (!_fikaAvailable || _packetRegistered || _packetRegistrationAttempted || _packetType == null) return;
+
+            var manager = GetNetworkManager();
+            if (manager == null)
+            {
+                _packetRegistrationAttempted = true;
+                Log.LogWarning("[Mortar] FIKA: NetworkManager not available — packet registration skipped.");
+                return;
+            }
+
+            Log.LogInfo("[Mortar] FIKA: Registering packet from raid-start fallback (NetworkManagerCreated did not fire).");
+            RegisterPacketOn(manager);
+        }
+
+        private static void RegisterPacketOn(object manager)
+        {
+            if (!_fikaAvailable || _packetRegistered || _packetType == null || manager == null) return;
             _packetRegistrationAttempted = true;
 
             try
             {
-                var manager = GetNetworkManager();
-                if (manager == null)
-                {
-                    Log.LogWarning("[Mortar] FIKA: NetworkManager not available — packet registration skipped.");
-                    return;
-                }
-
                 var managerType = manager.GetType();
                 Log.LogInfo($"[Mortar] FIKA: NetworkManager = {managerType.Name}");
 
@@ -402,13 +537,71 @@ namespace MortarStrikes
             _sendDataResolved = null;
         }
 
+        /// <summary>
+        /// Detaches our Fika event handlers. Call on plugin teardown so the dispatcher's delegate chain does not
+        /// keep invoking handlers from an unloaded plugin instance across reloads.
+        /// </summary>
+        public static void Shutdown()
+        {
+            // Fika's FikaEventDispatcher.UnsubscribeEvent<T> subtracts a freshly-allocated closure, so it cannot
+            // actually match the one SubscribeEvent<T> added. Call it anyway in case that is fixed upstream, but
+            // rely on nulling the callback to make any surviving handler inert.
+            TryUnsubscribe(_raidStartedEventType, _raidStartedHandler);
+            TryUnsubscribe(_networkManagerCreatedEventType, _networkManagerCreatedHandler);
+
+            _raidStartedCallback = null;
+            _raidStartedHandler = null;
+            _raidStartedSubscribed = false;
+            _networkManagerCreatedHandler = null;
+            _networkManagerCreatedSubscribed = false;
+
+            ResetRaidState();
+        }
+
+        private static void TryUnsubscribe(Type eventType, Delegate handler)
+        {
+            if (_unsubscribeEventMethod == null || eventType == null || handler == null) return;
+            try
+            {
+                _unsubscribeEventMethod.MakeGenericMethod(eventType).Invoke(null, new object[] { handler });
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[Mortar] FIKA: Unsubscribe from {eventType.Name} failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Fika 2.3.0+ downs players on lethal damage instead of killing them (server reviveConfig driven), and
+        /// a downed player still shows up in GameWorld.AllAlivePlayersList. Returns true only when Fika reports
+        /// this player as downed; a non-Fika or non-Fika-player instance is never downed.
+        /// </summary>
+        public static bool IsPlayerDowned(object player)
+        {
+            if (!_fikaAvailable || player == null) return false;
+            try
+            {
+                var type = player.GetType();
+                if (_downedProp == null || _downedDeclaringType == null || !_downedDeclaringType.IsInstanceOfType(player))
+                {
+                    var prop = type.GetProperty("Downed", BindingFlags.Public | BindingFlags.Instance);
+                    if (prop == null || prop.PropertyType != typeof(bool)) return false;
+                    _downedProp = prop;
+                    _downedDeclaringType = type;
+                }
+
+                return (bool)_downedProp.GetValue(player);
+            }
+            catch { return false; }
+        }
+
         private static void BuildPacketType()
         {
             try
             {
-                var iNetSer = FindTypeInAllAssemblies("INetSerializable");
-                var writerType = FindTypeInAllAssemblies("NetDataWriter");
-                var readerType = FindTypeInAllAssemblies("NetDataReader");
+                var iNetSer = FindFikaType("INetSerializable");
+                var writerType = FindFikaType("NetDataWriter");
+                var readerType = FindFikaType("NetDataReader");
 
                 if (iNetSer == null || writerType == null || readerType == null)
                 {
@@ -545,6 +738,26 @@ namespace MortarStrikes
             if (_networkManagerSingletonProp == null) return null;
             try { return _networkManagerSingletonProp.GetValue(null); }
             catch { return null; }
+        }
+
+        /// <summary>
+        /// Resolves a type by short name, preferring Fika.Core.
+        /// Fika vendors its own LiteNetLib copy under Fika.Core.Networking.LiteNetLib(.Utils), so resolving
+        /// INetSerializable / NetDataWriter / NetDataReader across all loaded assemblies can bind to a
+        /// different copy and produce a packet type RegisterPacket&lt;T&gt; rejects.
+        /// </summary>
+        private static Type FindFikaType(string shortName)
+        {
+            if (_fikaAsm != null)
+            {
+                try
+                {
+                    var t = _fikaAsm.GetTypes().FirstOrDefault(x => x.Name == shortName);
+                    if (t != null) return t;
+                }
+                catch { }
+            }
+            return FindTypeInAllAssemblies(shortName);
         }
 
         private static Type FindTypeInAllAssemblies(string shortName)

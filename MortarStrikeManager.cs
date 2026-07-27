@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -791,16 +792,36 @@ namespace MortarStrikes
             return mat;
         }
 
+        /// <summary>
+        /// Live players eligible to be targeted. Fika 2.3.0+ downs a player on lethal damage instead of killing
+        /// them, and a downed player is still in AllAlivePlayersList — but they are immobile and awaiting a
+        /// revive or bleedout, so shelling them is both unfair and pointless. Treat downed as not selectable.
+        /// </summary>
+        private static List<Player> SelectableTargets(GameWorld gw)
+        {
+            var alive = gw.AllAlivePlayersList;
+            if (alive == null) return null;
+
+            var selectable = new List<Player>(alive.Count);
+            foreach (var p in alive)
+            {
+                if (p == null) continue;
+                if (FikaSync.IsPlayerDowned(p)) continue;
+                selectable.Add(p);
+            }
+            return selectable;
+        }
+
         private IEnumerator ExecuteStrike(bool withSiren)
         {
             var gw = Singleton<GameWorld>.Instance;
             if (gw == null) yield break;
-            var alive = gw.AllAlivePlayersList;
+            var alive = SelectableTargets(gw);
             if (alive == null) yield break;
             for (int waitRetry = 0; alive.Count == 0 && Plugin.IsInRaid() && waitRetry < 4; waitRetry++)
             {
                 yield return new WaitForSeconds(30f);
-                alive = gw.AllAlivePlayersList;
+                alive = SelectableTargets(gw);
                 if (alive == null) yield break;
             }
             if (alive.Count == 0) yield break;
